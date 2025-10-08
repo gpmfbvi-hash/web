@@ -1,43 +1,129 @@
 /*
  * GPMF Gold Token 관리자 페이지
  * Network: BSC Mainnet (Chain ID: 56) ONLY
+ * 보안 강화 및 에러 핸들링 개선 버전
  */
 let Network = 56; // BSC Mainnet
 const NETWORKS = { "56": "bsc" };
 
-// ====== 유틸 ======
+var WalletAddress = "";
+var web3;
+var ethersProvider;
+var ethersSigner;
 
-// ====== 에러/연결 공통 처리 ======
+// ====== 유틸 함수 ======
+function isValidEthereumAddress(address) {
+  return /^0x[a-fA-F0-9]{40}$/.test(address);
+}
+
+function isValidAmount(amount, min = 0, max = 1000000000) {
+  const num = Number(amount);
+  return !isNaN(num) && num >= min && num <= max;
+}
+
+function isValidInteger(amount, min = 1, max = 1000000000) {
+  const num = Number(amount);
+  return !isNaN(num) && Number.isInteger(num) && num >= min && num <= max;
+}
+
+function fmtToken(bn) {
+  try { return `${ethers.utils.formatEther(bn)} GPMF`; } catch (_) { return '-'; }
+}
+
+function fmtBNB(bn) {
+  try { return `${ethers.utils.formatEther(bn)} BNB`; } catch (_) { return '-'; }
+}
+
+function rebuildProviders() {
+  if (!window.ethereum) return;
+  web3 = new Web3(window.ethereum);
+  ethersProvider = new ethers.providers.Web3Provider(window.ethereum);
+  ethersSigner = ethersProvider.getSigner();
+}
+
+function createInput({ id, placeholder, className = 'form-input', type = 'text', attrs = {} }) {
+  const input = document.createElement('input');
+  input.type = type;
+  input.id = id;
+  input.placeholder = placeholder;
+  input.className = className;
+  Object.entries(attrs).forEach(([k, v]) => input.setAttribute(k, v));
+  return input;
+}
+
+function createRow(children = [], gap = '8px') {
+  const row = document.createElement('div');
+  row.style.display = 'flex';
+  row.style.gap = gap;
+  row.style.flexWrap = 'wrap';
+  children.forEach(ch => row.appendChild(ch));
+  return row;
+}
+
+function setText(id, v) {
+  const el = document.getElementById(id);
+  if (el) el.innerText = v;
+}
+
+// ====== 에러 처리 (보안 강화) ======
 function friendlyError(e) {
   try {
-    // Trust Wallet / EIP-1193 user rejected
+    // 사용자 거부
     if (e && (e.code === 4001 || e.code === 'ACTION_REJECTED' || (e.message || '').toLowerCase().includes('user rejected'))) {
       return '트랜잭션을 취소하였습니다.';
     }
+
     const msg = (e?.data?.message) || (e?.error?.message) || (e?.message) || String(e);
 
-    // 네트워크/컨트랙트 관련 오류 처리 강화
+    // RPC 관련 에러 (타임아웃, 연결 문제)
+    if (/timeout|timed out|could not detect network|missing response|failed to fetch|network request failed/i.test(msg)) {
+      return 'RPC 서버 응답 대기 중 타임아웃이 발생했습니다.\n\n트랜잭션은 전송되었을 수 있으니 BscScan에서 확인해주세요.\n잠시 후 페이지를 새로고침하여 상태를 확인하세요.';
+    }
+
+    // 컨트랙트 연결 실패
     if (/Returned values aren't valid|did it run Out of Gas|not using the correct ABI|requesting data from a block number that does not exist|node which is not fully synced/i.test(msg)) {
       return '선택된 네트워크에서 컨트랙트를 찾을 수 없습니다. 상단에서 올바른 네트워크(BSC Mainnet)를 선택했는지 확인해주세요.';
     }
 
-    // 컨트랙트 호출 실패 관련
+    // 컨트랙트 실행 에러 (구체적인 이유 파싱)
     if (/execution reverted|call exception|contract call failed/i.test(msg)) {
-      return '컨트랙트 호출에 실패했습니다. 네트워크 연결 상태와 컨트랙트 주소를 확인해주세요.';
+      // Revert 이유 추출
+      const revertMatch = msg.match(/reverted with reason string ['"]([^'"]+)['"]/i);
+      if (revertMatch) {
+        return `컨트랙트 실행 거부: ${revertMatch[1]}`;
+      }
+      
+      // 특정 에러 메시지 매칭
+      if (/NoLockupExists/i.test(msg)) return '락업이 존재하지 않습니다.';
+      if (/LockupNotExpired/i.test(msg)) return '락업이 아직 만료되지 않았습니다. 만료된 락업만 제거할 수 있습니다.';
+      if (/OnlyDecrease/i.test(msg)) return '현재 락업 수량보다 작은 값만 입력 가능합니다.';
+      if (/AmountExceedsLocked/i.test(msg)) return '해제할 수량이 현재 락업 수량보다 많습니다.';
+      if (/InvalidLockupDuration/i.test(msg)) return '유효하지 않은 락업 시간입니다. 1분 이상이어야 합니다.';
+      if (/InsufficientBalance/i.test(msg)) return '잔액이 부족합니다.';
+      if (/InvalidAmount/i.test(msg)) return '유효하지 않은 수량입니다.';
+      if (/ZeroAddress/i.test(msg)) return '유효하지 않은 주소입니다 (0x0 주소 사용 불가).';
+      if (/EnforcedPause/i.test(msg)) return '컨트랙트가 일시정지 상태입니다. 전송이 불가능합니다.';
+      
+      return '컨트랙트 호출에 실패했습니다. 입력값과 권한을 확인해주세요.';
     }
 
-    // 잘 알려진 케이스 매핑
-    if (/insufficient funds/i.test(msg) || e?.code === 'INSUFFICIENT_FUNDS') return '지갑 잔액이 부족합니다.';
+    // 잔액 부족
+    if (/insufficient funds/i.test(msg) || e?.code === 'INSUFFICIENT_FUNDS') return '지갑 잔액(BNB)이 부족합니다. 가스비를 위한 BNB가 필요합니다.';
+    
+    // 논스 에러
     if (/nonce too low/i.test(msg)) return '논스가 낮습니다. 지갑을 새로고침하거나 잠시 후 다시 시도해주세요.';
     if (/replacement (fee|underpriced)/i.test(msg)) return '대체 트랜잭션 수수료가 낮습니다. 가스 가격/한도를 높여 재시도하세요.';
-    if (e?.code === 'UNPREDICTABLE_GAS_LIMIT' || /gas required exceeds allowance|always failing transaction/i.test(msg)) return '가스 추정에 실패했습니다. 입력값, 권한, 컨트랙트 상태를 확인해주세요.';
-    if (/invalid address/i.test(msg)) return '잘못된 주소 형식입니다.';
-    if (/invalid (bignumber|number|uint)/i.test(msg)) return '숫자 형식이 올바르지 않습니다.';
-    if (e?.code === 'CALL_EXCEPTION' || /call exception|execution reverted/i.test(msg)) {
-      // revert reason 추출
-      const m = msg.match(/reverted with reason string ['"]([^'"]+)['"]/i);
-      return '컨트랙트 실행이 거부(revert)되었습니다' + (m ? `: ${m[1]}` : '');
+    
+    // 가스 추정 실패
+    if (e?.code === 'UNPREDICTABLE_GAS_LIMIT' || /gas required exceeds allowance|always failing transaction/i.test(msg)) {
+      return '입력값, 권한, 컨트랙트 상태를 확인해주세요.\n\n💡 팁: 락업 관련 함수는 올바른 조건에서만 실행 가능합니다. 입력값이 적절하지 않을 수 있습니다. 만료 락업 제거는 락업 중 사용 불가능합니다.';
     }
+    
+    // 주소/숫자 형식 에러
+    if (/invalid address/i.test(msg)) return '잘못된 주소 형식입니다. 0x로 시작하는 42자리 주소를 입력하세요.';
+    if (/invalid (bignumber|number|uint)/i.test(msg)) return '숫자 형식이 올바르지 않습니다. 유효한 숫자를 입력하세요.';
+    
+    // 네트워크 에러
     if (/network error|chain|wrong network|unsupported chain id/i.test(msg)) return '네트워크 오류입니다. 상단에서 올바른 네트워크를 선택했는지 확인하세요.';
 
     return '오류: ' + msg;
@@ -104,52 +190,7 @@ async function ensureConnected() {
   }
 }
 
-function isValidEthereumAddress(address) {
-  return /^0x[a-fA-F0-9]{40}$/.test(address);
-}
-function isValidAmount(amount, min = 1, max = 1000000000) {
-  const num = Number(amount);
-  return !isNaN(num) && num >= min && num <= max;
-}
-function fmtToken(bn) {
-  try { return `${ethers.utils.formatEther(bn)} GPMF`; } catch (_) { return '-'; }
-}
-function fmtBNB(bn) {
-  try { return `${ethers.utils.formatEther(bn)} BNB`; } catch (_) { return '-'; }
-}
-
-function rebuildProviders() {
-  if (!window.ethereum) return;
-  web3 = new Web3(window.ethereum);
-  ethersProvider = new ethers.providers.Web3Provider(window.ethereum);
-  ethersSigner = ethersProvider.getSigner();
-}
-
-// 동적 입력 유틸
-function createInput({ id, placeholder, className = 'form-input', type = 'text', attrs = {} }) {
-  const input = document.createElement('input');
-  input.type = type;
-  input.id = id;
-  input.placeholder = placeholder;
-  input.className = className;
-  Object.entries(attrs).forEach(([k, v]) => input.setAttribute(k, v));
-  return input;
-}
-function createRow(children = [], gap = '8px') {
-  const row = document.createElement('div');
-  row.style.display = 'flex';
-  row.style.gap = gap;
-  row.style.flexWrap = 'wrap';
-  children.forEach(ch => row.appendChild(ch));
-  return row;
-}
-
-var WalletAddress = "";
-var web3;
-var ethersProvider;
-var ethersSigner;
-
-// ====== 초기화/지갑 ======
+// ====== 초기화 ======
 async function initializeWeb3() {
   if (typeof window.ethereum === 'undefined') {
     alert('Trust Wallet 또는 메타마스크를 설치해주세요.');
@@ -167,7 +208,7 @@ async function initializeWeb3() {
 }
 
 async function addChainIfNeeded(chainIdHex) {
-  if (chainIdHex === '0x38') { // BSC Mainnet: 56
+  if (chainIdHex === '0x38') {
     try {
       await window.ethereum.request({
         method: 'wallet_addEthereumChain',
@@ -183,23 +224,17 @@ async function addChainIfNeeded(chainIdHex) {
   }
 }
 
-// ====== 네트워크/링크 ======
+// ====== 네트워크 ======
 function setupBscScanLinks() {
   if (!CONTRACT_ADDRESS) return;
 
-  const baseUrl = "https://bscscan.com"; // BSC Mainnet only
+  const baseUrl = "https://bscscan.com";
 
-  document.getElementById("bscscanContract").href =
-    `${baseUrl}/address/${CONTRACT_ADDRESS}`;
-
-  document.getElementById("bscscanTokenTracker").href =
-    `${baseUrl}/token/${CONTRACT_ADDRESS}`;
-
-  document.getElementById("bscscanHoldAddress").href =
-    `${baseUrl}/token/${CONTRACT_ADDRESS}#balances`;
+  document.getElementById("bscscanContract").href = `${baseUrl}/address/${CONTRACT_ADDRESS}`;
+  document.getElementById("bscscanTokenTracker").href = `${baseUrl}/token/${CONTRACT_ADDRESS}`;
+  document.getElementById("bscscanHoldAddress").href = `${baseUrl}/token/${CONTRACT_ADDRESS}#balances`;
 }
 
-// 네트워크 변경 시에도 추가 확인
 async function checkAndSwitchNetwork() {
   try {
     const currentChainId = await window.ethereum.request({ method: 'eth_chainId' });
@@ -221,7 +256,6 @@ async function checkAndSwitchNetwork() {
     }
 
     rebuildProviders();
-
     setupBscScanLinks();
     return true;
   } catch (e) {
@@ -233,19 +267,18 @@ async function checkAndSwitchNetwork() {
 
 async function testContractConnection() {
   if (!WalletAddress || !web3) {
-    return true; // 지갑이 연결되지 않은 상태면 테스트 스킵
+    return true;
   }
 
   try {
     const c = new web3.eth.Contract(ABI, CONTRACT_ADDRESS);
-    await c.methods.name().call(); // 간단한 호출로 연결 테스트
+    await c.methods.name().call();
     return true;
   } catch (testError) {
     console.warn('컨트랙트 연결 테스트 실패:', testError);
 
     const errorMessage = testError?.message || String(testError);
 
-    // 컨트랙트를 찾을 수 없는 경우의 에러 패턴 감지
     if (/Returned values aren't valid|did it run Out of Gas|not using the correct ABI|requesting data from a block number that does not exist|node which is not fully synced/i.test(errorMessage)) {
       alert(`BSC Mainnet에서 컨트랙트를 찾을 수 없습니다.\n\nsmartcontract.js에서 컨트랙트 주소가 올바른지 확인해주세요.\n\n현재 주소: ${CONTRACT_ADDRESS}`);
     } else {
@@ -256,6 +289,7 @@ async function testContractConnection() {
   }
 }
 
+// ====== 지갑 연결 ======
 async function connectWallet() {
   const ok = await initializeWeb3();
   if (!ok) return;
@@ -271,7 +305,6 @@ async function connectWallet() {
 
   WalletAddress = accounts[0];
   document.getElementById('walletAddress').innerText = WalletAddress;
-  // UI 상태 업데이트
   updateUIState(true);
 
   const walletBtn = document.querySelector('.btn-connect-wallet');
@@ -280,12 +313,9 @@ async function connectWallet() {
     walletBtn.onclick = refreshWallet;
   }
 
-  // 지갑 연결 직후 정보 동기화
-  await updateWalletInfo();      // BNB, GPMF, 권한 등 한번에 업데이트
-  await loadContractState();     // 컨트랙트 상태 갱신 
+  await updateWalletInfo();
+  await loadContractState();
   await Promise.allSettled([checkTokenBalance(), checkWalletRole()]);
-
-  // 🔥 보유 토큰 & 권한을 즉시 반영 (중복 호출이지만 UI 확실하게 반영됨)
   await checkTokenBalance();
   await checkWalletRole();
 }
@@ -336,7 +366,6 @@ async function checkWalletRole() {
       el.classList.add('normal'); 
     }
 
-    // Owner만 버튼 활성화
     updateOwnerControls(isOwner);
 
   } catch (e) {
@@ -346,7 +375,6 @@ async function checkWalletRole() {
 }
 
 function updateOwnerControls(isOwner) {
-  // Owner 전용 버튼들 활성화/비활성화
   const ownerButtons = document.querySelectorAll('.owner-only');
   ownerButtons.forEach(btn => {
     btn.disabled = !isOwner;
@@ -361,10 +389,23 @@ async function pauseToken() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.pause();
     const tx = await c.pause({ gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert('토큰 일시정지 완료');
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert('✅ 토큰 일시정지 완료\n\n트랜잭션 해시: ' + tx.hash);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('Pause 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 async function unpauseToken() {
@@ -373,10 +414,23 @@ async function unpauseToken() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.unpause();
     const tx = await c.unpause({ gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert('토큰 정상화 완료');
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert('✅ 토큰 정상화 완료\n\n트랜잭션 해시: ' + tx.hash);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('Unpause 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 // ====== Lockup 관리 ======
@@ -396,10 +450,23 @@ async function setLockup() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.setLockup(account, minutes, amountWei);
     const tx = await c.setLockup(account, minutes, amountWei, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`락업 설정 완료: ${amount} GPMF를 ${minutes}분 동안 락업`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 락업 설정 완료\n\n주소: ${account}\n수량: ${amount} GPMF\n시간: ${minutes}분\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('SetLockup 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 async function extendLockup() {
@@ -414,10 +481,23 @@ async function extendLockup() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.extendLockup(account, addMinutes);
     const tx = await c.extendLockup(account, addMinutes, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`락업 연장 완료: ${addMinutes}분 추가됨`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 락업 연장 완료\n\n주소: ${account}\n추가 시간: ${addMinutes}분\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('ExtendLockup 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 async function decreaseLockAmount() {
@@ -434,10 +514,23 @@ async function decreaseLockAmount() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.decreaseLockAmount(account, amountWei);
     const tx = await c.decreaseLockAmount(account, amountWei, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`락업 수량 감소 완료\n새로운 락업 수량: ${newAmount} GPMF\n\n⚠️ 주의: 기존 수량에서 빼는 것이 아니라 새 수량으로 교체되었습니다!`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 락업 수량 감소 완료\n\n주소: ${account}\n새로운 락업 수량: ${newAmount} GPMF\n\n⚠️ 주의: 기존 수량에서 빼는 것이 아니라 새 수량으로 교체되었습니다!\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('DecreaseLockAmount 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 async function releaseLockup() {
@@ -454,10 +547,23 @@ async function releaseLockup() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.releaseLockup(account, amountWei);
     const tx = await c.releaseLockup(account, amountWei, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`락업 부분 해제 완료\n해제된 수량: ${amount} GPMF\n\n✅ 입력한 수량만큼 기존 락업에서 차감되었습니다!`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 락업 부분 해제 완료\n\n주소: ${account}\n해제된 수량: ${amount} GPMF\n\n✅ 입력한 수량만큼 기존 락업에서 차감되었습니다!\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('ReleaseLockup 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 async function clearExpiredLockup() {
@@ -467,13 +573,28 @@ async function clearExpiredLockup() {
     
     if (!isValidEthereumAddress(account)) throw new Error('주소 형식 오류');
     
+    // 컨트랙트가 알아서 만료 여부를 체크하므로 바로 실행
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.clearExpiredLockup(account);
     const tx = await c.clearExpiredLockup(account, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`만료된 락업 제거 완료\n\n컨트랙트 저장소에서 깔끔하게 정리되었습니다.\n이 작업은 필수가 아니며 가스비 절약을 위한 선택사항입니다.`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    // RPC 에러 대응: wait 타임아웃 처리
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 만료된 락업 제거 완료\n\n주소: ${account}\n\n컨트랙트 저장소에서 깔끔하게 정리되었습니다.\n이 작업은 필수가 아니며 가스비 절약을 위한 선택사항입니다.\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\n영수증 확인에 실패했지만 트랜잭션은 블록체인에 전송되었습니다.\nBscScan에서 확인해주세요: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('ClearExpiredLockup 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 // ====== Lockup 조회 ======
@@ -489,18 +610,15 @@ async function checkLockupInfo() {
     const remainingSec = Number(info.remainingSeconds);
     const expiration = Number(info.expiration);
     
-    // 락업이 없거나 만료된 경우
     if (Number(locked) === 0 || remainingSec === 0) {
       document.getElementById('lockupInfoResult').innerText = '❌ 아직 락업 상태가 아닙니다.';
       document.getElementById('lockupInfoResult').style.borderColor = '#888';
       return;
     }
     
-    // 만료 시간 계산 (정확한 한국 시간)
     const expirationDate = new Date(expiration * 1000);
     const now = new Date();
     
-    // 남은 시간을 일/시/분/초로 변환
     const days = Math.floor(remainingSec / 86400);
     const hours = Math.floor((remainingSec % 86400) / 3600);
     const minutes = Math.floor((remainingSec % 3600) / 60);
@@ -584,10 +702,23 @@ async function transferToken() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.transfer(to, amountWei);
     const tx = await c.transfer(to, amountWei, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`전송 완료!\n받는 주소: ${to}\n전송 수량: ${amount} GPMF\n\n✅ 트랜잭션이 성공적으로 처리되었습니다.`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 전송 완료!\n\n받는 주소: ${to}\n전송 수량: ${amount} GPMF\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await updateWalletInfo();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('Transfer 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 // ====== 토큰 소각 ======
@@ -603,11 +734,24 @@ async function burnToken() {
     const c = new ethers.Contract(CONTRACT_ADDRESS, ABI, ethersSigner);
     const gas = await c.estimateGas.burn(amountWei);
     const tx = await c.burn(amountWei, { gasLimit: gas.mul(120).div(100) });
-    await tx.wait();
-    alert(`소각 완료!\n소각된 수량: ${amount} GPMF\n\n⚠️ 이 토큰은 영구적으로 제거되었으며 복구할 수 없습니다.\n총 공급량도 함께 감소했습니다.`);
+    
+    console.log('트랜잭션 전송됨:', tx.hash);
+    
+    try {
+      const receipt = await tx.wait();
+      console.log('트랜잭션 성공:', receipt);
+      alert(`✅ 소각 완료!\n\n소각된 수량: ${amount} GPMF\n\n⚠️ 이 토큰은 영구적으로 제거되었으며 복구할 수 없습니다.\n총 공급량도 함께 감소했습니다.\n\n트랜잭션 해시: ${tx.hash}`);
+    } catch (waitError) {
+      console.warn('영수증 대기 중 에러 (트랜잭션은 전송됨):', waitError);
+      alert(`⚠️ 트랜잭션이 전송되었습니다\n\n트랜잭션 해시: ${tx.hash}\n\nBscScan에서 확인: https://bscscan.com/tx/${tx.hash}`);
+    }
+    
     await updateWalletInfo();
     await loadContractState();
-  } catch (e) { alert(friendlyError(e)); }
+  } catch (e) {
+    console.error('Burn 에러:', e);
+    alert(friendlyError(e));
+  }
 }
 
 // ====== 토큰 정보 조회 ======
@@ -634,7 +778,6 @@ async function checkBalance() {
 
 // ====== 컨트랙트 상태 조회 ======
 async function loadContractState() {
-  // 지갑이 연결되지 않은 상태면 스킵
   if (!WalletAddress || !ethersSigner) {
     return;
   }
@@ -654,7 +797,6 @@ async function loadContractState() {
       c.owner()
     ]);
 
-    // DOM 반영
     setText('st_name', name);
     setText('st_symbol', symbol);
     setText('st_decimals', decimals.toString());
@@ -667,7 +809,6 @@ async function loadContractState() {
 
     const errorMessage = e?.message || String(e);
 
-    // 네트워크 불일치 감지
     if (/Returned values aren't valid|did it run Out of Gas|not using the correct ABI|requesting data from a block number that does not exist|node which is not fully synced/i.test(errorMessage)) {
       alert(`BSC Mainnet에서 컨트랙트를 찾을 수 없습니다.\n\nsmartcontract.js에서 컨트랙트 주소를 확인해주세요.\n\n현재 주소: ${CONTRACT_ADDRESS}`);
     } else {
@@ -679,11 +820,9 @@ async function loadContractState() {
 async function onNetworkChange(newNetworkId) {
   Network = parseInt(newNetworkId, 10);
 
-  // 네트워크 전환
   const switched = await checkAndSwitchNetwork();
   if (!switched) return;
 
-  // 지갑이 연결되어 있지 않다면 자동 연결 시도
   if (!WalletAddress) {
     try {
       const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
@@ -697,26 +836,16 @@ async function onNetworkChange(newNetworkId) {
         }
       }
     } catch (connectError) {
-      // 사용자가 지갑 연결을 거부한 경우 - 조용히 넘어감
       console.log('지갑 연결 취소됨');
       return;
     }
   }
 
-  // 지갑이 연결된 상태에서만 업데이트 및 컨트랙트 테스트
   if (WalletAddress) {
     await updateWalletInfo();
     await loadContractState();
-
-    // 컨트랙트 연결 테스트 (연결 후에만)
     await testContractConnection();
   }
-}
-
-// 안전한 text 주입 헬퍼
-function setText(id, v) {
-  const el = document.getElementById(id);
-  if (el) el.innerText = v;
 }
 
 // ====== 초기 DOM 세팅 ======
@@ -729,6 +858,5 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // 기본 상태
   updateUIState(false);
 });
